@@ -45,17 +45,12 @@ class CTranspiler(ast.NodeVisitor):
         - -int -> "int *"
         - int[10] -> "int[10]"
         - int(int, int) -> "int (*)(int, int)"
+        - type[F] -> "struct F" or "F" (if typedef'd)
         """
         if isinstance(node, ast.Name):
             # Basic type: int, char, float, double, void, etc.
+            # Bare names are used as-is (could be typedef names or basic types)
             type_name = node.id
-            # Check if it's a composite type
-            if type_name in self.union_types:
-                type_name = f"union {type_name}"
-            elif type_name in self.enum_types:
-                type_name = f"enum {type_name}"
-            elif type_name in self.struct_types or (type_name[0].isupper() and type_name not in ('Union', 'Enum')):
-                type_name = f"struct {type_name}"
             if var_name:
                 return f"{type_name} {var_name}"
             else:
@@ -93,9 +88,29 @@ class CTranspiler(ast.NodeVisitor):
                 raise ValueError(f"Invalid pointer-to-array type: {ast.dump(node)}")
 
         elif isinstance(node, ast.Subscript):
-            # Could be array type or qualifier
+            # Could be array type, qualifier, or type[F]
             if isinstance(node.value, ast.Name):
                 name = node.value.id
+
+                # Special case: type[F] (structs), union[F], enum[F]
+                if name in ('type', 'union', 'enum'):
+                    inner_name = node.slice.id if isinstance(node.slice, ast.Name) else None
+                    if inner_name:
+                        # type[F] -> "struct F"
+                        # union[F] -> "union F"
+                        # enum[F] -> "enum F"
+                        if name == 'union':
+                            type_str = f"union {inner_name}"
+                        elif name == 'enum':
+                            type_str = f"enum {inner_name}"
+                        else:  # type
+                            type_str = f"struct {inner_name}"
+
+                        if var_name:
+                            return f"{type_str} {var_name}"
+                        else:
+                            return type_str
+
                 # Check if it's a qualifier/storage class
                 if name in ('const', 'volatile', 'unsigned', 'static', 'extern', 'long'):
                     # Qualifier: const[int] -> const int
@@ -119,6 +134,20 @@ class CTranspiler(ast.NodeVisitor):
                     inner = self.emit_type(node.value, "")
                     final_type = self.emit_type(node.slice, var_name)
                     return f"{inner} {final_type}".strip()
+                # Check if outer is type[], enum[], or union[] (e.g., type[Point][3])
+                elif isinstance(node.value.value, ast.Name) and node.value.value.id in ('type', 'enum', 'union'):
+                    # Array of type[F]/enum[E]/union[U]
+                    # node.value is type[Point], node.slice is 3
+                    base_type = self.emit_type(node.value, "")  # Get "struct Point"
+                    # Collect array dimensions (everything after type[Point])
+                    dims = [node.slice]
+                    # Check if there are more dimensions (e.g., type[Point][3][4])
+                    # This is rare but possible
+                    dim_str = "".join(f"[{self.emit_expr(d)}]" for d in dims)
+                    if var_name:
+                        return f"{base_type} {var_name}{dim_str}".strip()
+                    else:
+                        return f"{base_type}{dim_str}".strip()
                 else:
                     # Array of arrays
                     dims = self.collect_array_dimensions(node)
@@ -375,19 +404,17 @@ class CTranspiler(ast.NodeVisitor):
         if isinstance(node.func, ast.Name) and node.func.id == 'sizeof':
             if len(node.args) == 1:
                 arg = node.args[0]
+                # Emit the type as-is using emit_type
+                # This respects type[F], enum[E], union[U] syntax
                 if isinstance(arg, ast.Name):
-                    name = arg.id
-                    if name in self.struct_types:
-                        return f"sizeof(struct {name})"
-                    elif name in self.union_types:
-                        return f"sizeof(union {name})"
-                    elif name in self.enum_types:
-                        return f"sizeof(enum {name})"
-                    else:
-                        # Basic type like int, char, etc.
-                        return f"sizeof({name})"
+                    # Simple name - emit as-is (could be typedef or basic type)
+                    return f"sizeof({arg.id})"
+                elif isinstance(arg, ast.Subscript):
+                    # Could be type[F], enum[E], union[U], or array type
+                    type_str = self.emit_type(arg, "")
+                    return f"sizeof({type_str})"
                 else:
-                    # Expression
+                    # Expression like sizeof(ptr._) or sizeof(arr[0])
                     arg_str = self.emit_expr(arg)
                     return f"sizeof({arg_str})"
 
@@ -843,17 +870,40 @@ class CTranspiler(ast.NodeVisitor):
         is_union = any(isinstance(base, ast.Name) and base.id == 'Union' for base in node.bases)
         is_enum = any(isinstance(base, ast.Name) and base.id == 'Enum' for base in node.bases)
 
+        # Check decorators for @typedef and @var
+        has_typedef = False
+        typedef_name = None
+        var_names = []
+
+        for decorator in node.decorator_list:
+            if isinstance(decorator, ast.Call):
+                if isinstance(decorator.func, ast.Name):
+                    if decorator.func.id == 'typedef':
+                        # @typedef(Name)
+                        has_typedef = True
+                        if decorator.args and isinstance(decorator.args[0], ast.Name):
+                            typedef_name = decorator.args[0].id
+                    elif decorator.func.id == 'var':
+                        # @var(a, b, c)
+                        var_names = [arg.id for arg in decorator.args if isinstance(arg, ast.Name)]
+
         # Record the type
         if is_union:
             self.union_types.add(class_name)
+            composite_type = "union"
         elif is_enum:
             self.enum_types.add(class_name)
+            composite_type = "enum"
         else:
             self.struct_types.add(class_name)
+            composite_type = "struct"
 
         if is_enum:
             # Enum
-            self.emit(f"{self.indent()}enum {class_name} {{")
+            if has_typedef:
+                self.emit(f"{self.indent()}typedef enum {class_name} {{")
+            else:
+                self.emit(f"{self.indent()}enum {class_name} {{")
             self.indent_level += 1
 
             for stmt in node.body:
@@ -871,11 +921,29 @@ class CTranspiler(ast.NodeVisitor):
                         self.emit(f"{self.indent()}{name},")
 
             self.indent_level -= 1
-            self.emit(f"{self.indent()}}};")
+
+            # Emit closing with typedef or var declarations
+            if has_typedef and var_names:
+                # typedef ... } Name; Name a, b;
+                self.emit(f"{self.indent()}}} {typedef_name or class_name};")
+                var_list = ", ".join(var_names)
+                self.emit(f"{self.indent()}{typedef_name or class_name} {var_list};")
+            elif has_typedef:
+                # typedef ... } Name;
+                self.emit(f"{self.indent()}}} {typedef_name or class_name};")
+            elif var_names:
+                # ... } a, b;
+                var_list = ", ".join(var_names)
+                self.emit(f"{self.indent()}}} {var_list};")
+            else:
+                self.emit(f"{self.indent()}}};")
 
         elif is_union:
             # Union
-            self.emit(f"{self.indent()}union {class_name} {{")
+            if has_typedef:
+                self.emit(f"{self.indent()}typedef union {class_name} {{")
+            else:
+                self.emit(f"{self.indent()}union {class_name} {{")
             self.indent_level += 1
 
             for stmt in node.body:
@@ -885,11 +953,26 @@ class CTranspiler(ast.NodeVisitor):
                     self.emit(f"{self.indent()}{field_type};")
 
             self.indent_level -= 1
-            self.emit(f"{self.indent()}}};")
+
+            # Emit closing with typedef or var declarations
+            if has_typedef and var_names:
+                self.emit(f"{self.indent()}}} {typedef_name or class_name};")
+                var_list = ", ".join(var_names)
+                self.emit(f"{self.indent()}{typedef_name or class_name} {var_list};")
+            elif has_typedef:
+                self.emit(f"{self.indent()}}} {typedef_name or class_name};")
+            elif var_names:
+                var_list = ", ".join(var_names)
+                self.emit(f"{self.indent()}}} {var_list};")
+            else:
+                self.emit(f"{self.indent()}}};")
 
         else:
             # Struct
-            self.emit(f"{self.indent()}struct {class_name} {{")
+            if has_typedef:
+                self.emit(f"{self.indent()}typedef struct {class_name} {{")
+            else:
+                self.emit(f"{self.indent()}struct {class_name} {{")
             self.indent_level += 1
 
             for stmt in node.body:
@@ -902,7 +985,22 @@ class CTranspiler(ast.NodeVisitor):
                     self.visit(stmt)
 
             self.indent_level -= 1
-            self.emit(f"{self.indent()}}};")
+
+            # Emit closing with typedef or var declarations
+            if has_typedef and var_names:
+                # typedef ... } Name; Name a, b;
+                self.emit(f"{self.indent()}}} {typedef_name or class_name};")
+                var_list = ", ".join(var_names)
+                self.emit(f"{self.indent()}{typedef_name or class_name} {var_list};")
+            elif has_typedef:
+                # typedef ... } Name;
+                self.emit(f"{self.indent()}}} {typedef_name or class_name};")
+            elif var_names:
+                # ... } a, b;
+                var_list = ", ".join(var_names)
+                self.emit(f"{self.indent()}}} {var_list};")
+            else:
+                self.emit(f"{self.indent()}}};")
 
     def visit_TypeAlias(self, node):
         """Handle type alias (typedef)."""

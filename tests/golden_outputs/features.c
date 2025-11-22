@@ -62,32 +62,32 @@ printf("Debug mode\n");
 #define PI 3.14159
 #define SQUARE(x) ((x * x))
 #define MIN(a, b) ((a < b ? a : b))
-struct Point {
+typedef struct Point {
     int x;
     int y;
-};
+} Point;
 void test_struct(void) {
-    struct Point p = {10, 20};
+    Point p = {10, 20};
     struct Point q = {.x = 5, .y = 10};
     p.x = 3;
 }
-union Data {
+typedef union Data {
     int i;
     float f;
     char c;
-};
+} Data;
 void test_union(void) {
-    union Data d;
+    Data d;
     d.i = 42;
     d.f = 3.14;
 }
-enum Color {
+typedef enum Color {
     RED = 0,
     GREEN = 1,
     BLUE = 2,
-};
+} Color;
 void test_enum(void) {
-    enum Color c = RED;
+    Color c = RED;
     if (c == GREEN) {
         printf("green\n");
     }

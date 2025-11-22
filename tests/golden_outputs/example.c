@@ -1,12 +1,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #define MAX_SIZE 100
-struct Node {
+typedef struct Node {
     int data;
-    struct Node *next;
-};
-struct Node* create_node(int value) {
-    struct Node *node = malloc(sizeof(struct Node));
+    Node *next;
+} Node;
+Node* create_node(int value) {
+    Node *node = malloc(sizeof(Node));
     if (node == NULL) {
         return NULL;
     }
@@ -14,8 +14,8 @@ struct Node* create_node(int value) {
     node->next = NULL;
     return node;
 }
-void print_list(struct Node *head) {
-    struct Node *curr = head;
+void print_list(Node *head) {
+    Node *curr = head;
     while (curr != NULL) {
         printf("%d ", curr->data);
         curr = curr->next;
@@ -24,7 +24,7 @@ void print_list(struct Node *head) {
 }
 #define MAX(a, b) ((a > b ? a : b))
 int main(void) {
-    struct Node *head = create_node(1);
+    Node *head = create_node(1);
     head->next = create_node(2);
     head->next->next = create_node(3);
     print_list(head);

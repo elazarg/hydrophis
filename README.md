@@ -42,6 +42,7 @@ Input (`example.py`):
 ```python
 from stdio import *
 
+@typedef(Node)
 class Node:
     data: int
     next: -Node
@@ -64,13 +65,13 @@ Output:
 ```c
 #include <stdio.h>
 
-struct Node {
+typedef struct Node {
     int data;
-    struct Node *next;
-};
+    Node *next;
+} Node;
 
-struct Node *create_node(int value) {
-    struct Node *node = malloc(sizeof(struct Node));
+Node *create_node(int value) {
+    Node *node = malloc(sizeof(struct Node));
     if (node == NULL) {
         return NULL;
     }
@@ -80,7 +81,7 @@ struct Node *create_node(int value) {
 }
 
 int main(void) {
-    struct Node *head = create_node(42);
+    Node *head = create_node(42);
     printf("%d\n", head->data);
     return 0;
 }
@@ -96,6 +97,10 @@ int main(void) {
 - **Pointer-to-array**: `+int[10]` for `int (*)[10]`
 - **Qualifiers**: `const[int]`, `volatile[int]`, `unsigned[int]`
 - **Storage class**: `static[int]`, `extern[int]`
+- **Composite type references**:
+  - `type[F]` → `struct F`
+  - `enum[E]` → `enum E`
+  - `union[U]` → `union U`
 
 ### Special `_` Forms
 
@@ -111,21 +116,49 @@ The underscore is reserved for special operations:
 ### Composite Types
 
 ```python
-# Struct
+# Plain struct (use type[F] to reference)
 class Point:
     x: int
     y: int
 
-# Union
+p: type[Point]                    # struct Point p;
+
+# Struct with typedef
+@typedef(Point)
+class Point:
+    x: int
+    y: int
+
+p: Point                          # Point p; (uses typedef)
+
+# Struct with inline variables
+@var(v1, v2)
+class Data:
+    value: int
+# Generates: struct Data { int value; } v1, v2;
+
+# Combined typedef + var
+@typedef(Point)
+@var(p1, p2)
+class Point:
+    x: int
+    y: int
+# Generates: typedef struct Point { ... } Point; Point p1, p2;
+
+# Union (use union[F] to reference)
 class Data(Union):
     i: int
     f: float
 
-# Enum
+d: union[Data]                    # union Data d;
+
+# Enum (use enum[E] to reference)
 class Color(Enum):
     RED = 0
     GREEN = 1
     BLUE = 2
+
+c: enum[Color]                    # enum Color c;
 ```
 
 ### Control Flow
@@ -250,9 +283,7 @@ The project uses golden master testing to ensure transpiler output stability. Go
 To regenerate golden outputs after intentional changes:
 
 ```bash
-python src/arafura/transpiler.py tests/fixtures/example.py > tests/golden_outputs/example.c
-python src/arafura/transpiler.py tests/fixtures/features.py > tests/golden_outputs/features.c
-python src/arafura/transpiler.py tests/fixtures/typedef.py > tests/golden_outputs/typedef.c
+python -m scripts.regenerate_golden_outputs
 ```
 
 ## Design Philosophy

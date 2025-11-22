@@ -3,6 +3,7 @@ from stdlib import *
 
 MAX_SIZE: macro = 100              # #define MAX_SIZE 100
 
+@typedef(Node)
 class Node:
     data: int
     next: -Node

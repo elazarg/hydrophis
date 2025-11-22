@@ -97,6 +97,7 @@ def MIN(a, b):
     a if a < b else b
 
 # Struct with designated initializer
+@typedef(Point)
 class Point:
     x: int
     y: int
@@ -107,6 +108,7 @@ def test_struct() -> void:
     p.x = 3
 
 # Union
+@typedef(Data)
 class Data(Union):
     i: int
     f: float
@@ -118,6 +120,7 @@ def test_union() -> void:
     d.f = 3.14
 
 # Enum
+@typedef(Color)
 class Color(Enum):
     RED = 0
     GREEN = 1

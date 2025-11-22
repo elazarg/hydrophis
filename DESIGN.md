@@ -111,6 +111,17 @@ type binop = int(int, int)          # typedef int (*binop)(int, int);
 type byte = unsigned[char]          # typedef unsigned char byte;
 ```
 
+You can use `type[...]` on the right-hand side:
+
+```python
+@typedef(Point)
+class Point:
+    x: int
+    y: int
+
+type PointPtr = -type[Point]        # typedef Point *PointPtr;
+```
+
 ---
 
 ## 2. Composite Types: Struct / Union / Enum
@@ -126,13 +137,168 @@ class Point:                        # struct Point {
                                     # };
 ```
 
-Usage:
+#### 2.1.1 Basic Struct Usage
+
+For a plain struct without typedef:
 
 ```python
-p: Point                           # struct Point p;
-p = Point(10, 20)                  # struct Point p = {10, 20};
-p.x = 5                            # p.x = 5;
+class Point:
+    x: int
+    y: int
+
+p: type[Point]                     # struct Point p;
+ptr: -type[Point]                  # struct Point *ptr;
+points: type[Point][3]             # struct Point points[3];
 ```
+
+**Important:** Without a typedef, you must use `type[Point]` to reference the struct type. Bare `Point` in a type position does not mean `struct Point`.
+
+#### 2.1.2 Typedef Structs with `@typedef`
+
+Use the `@typedef` decorator to create a typedef for a struct:
+
+```python
+@typedef(Point)
+class Point:
+    x: int
+    y: int
+```
+
+**C translation:**
+
+```c
+typedef struct Point {
+    int x;
+    int y;
+} Point;
+```
+
+With a typedef, you can use the name directly:
+
+```python
+p: Point                           # Point p;           (uses typedef)
+ptr: -Point                        # Point *ptr;
+p2: type[Point]                    # struct Point p2;   (type[Point] always gives tagged form)
+```
+
+#### 2.1.3 Inline Variable Declarations with `@var`
+
+Use the `@var` decorator to declare variables inline with the struct definition:
+
+```python
+@var(a)
+class Point:
+    x: int
+    y: int
+```
+
+**C:**
+
+```c
+struct Point {
+    int x;
+    int y;
+} a;
+```
+
+Multiple variables:
+
+```python
+@var(a, b, c)
+class Point:
+    x: int
+    y: int
+```
+
+**C:**
+
+```c
+struct Point {
+    int x;
+    int y;
+} a, b, c;
+```
+
+#### 2.1.4 Combined `@typedef` and `@var`
+
+You can combine both decorators:
+
+```python
+@typedef(Point)
+@var(p1, p2)
+class Point:
+    x: int
+    y: int
+```
+
+**C:**
+
+```c
+typedef struct Point {
+    int x;
+    int y;
+} Point;
+Point p1, p2;
+```
+
+(First line is the typedef; second is a variable declaration using the typedef.)
+
+#### 2.1.5 The `type[...]`, `enum[...]`, `union[...]` Wrappers
+
+These syntax forms explicitly reference the C tagged types:
+
+* `type[F]` → `struct F`
+* `enum[E]` → `enum E`
+* `union[U]` → `union U`
+
+These always emit the tagged type form, regardless of whether a typedef exists. If you want to use a typedef name, use the bare name directly.
+
+#### 2.1.6 Struct Initialization
+
+**Positional:**
+
+```python
+@typedef(Point)
+class Point:
+    x: int
+    y: int
+
+p: Point = Point(10, 20)           # Point p = {10, 20};
+```
+
+**Designated (in declaration):**
+
+```python
+@typedef(Point)
+class Point:
+    x: int
+    y: int
+
+p: Point(x=10, y=20)               # Point p = {.x = 10, .y = 20};
+q: Point(x=5)                      # Point q = {.x = 5};
+```
+
+Annotation is `Call(func=Name('Point'), keywords=...)`.
+
+**Compound literals via `_` (contextual type):**
+
+```python
+@typedef(Point)
+class Point:
+    x: int
+    y: int
+
+p: Point
+p = _(x=10, y=20)                  # p = (Point){ .x = 10, .y = 20 };
+
+items: Point[3] = [
+    _(x=1, y=2),
+    _(x=3, y=4),
+    _(x=5, y=6),
+]
+```
+
+`_(...)` is always "compound literal with designated fields"; the type is taken from the surrounding context (e.g., element type of the array).
 
 ### 2.2 Nested Structs
 
@@ -144,43 +310,11 @@ class Outer:
         x: int
         y: int
 
-    inner: Inner
-    other: Inner
+    inner: type[Inner]
+    other: type[Inner]
 ```
 
 → `struct Outer { int value; struct Inner { ... }; struct Inner inner; struct Inner other; };`.
-
-### 2.3 Struct Initialization
-
-**Positional:**
-
-```python
-p: Point = Point(10, 20)           # struct Point p = {10, 20};
-```
-
-**Designated (in declaration):**
-
-```python
-p: Point(x=10, y=20)               # struct Point p = {.x = 10, .y = 20};
-q: Point(x=5)                      # struct Point q = {.x = 5};
-```
-
-Annotation is `Call(func=Name('Point'), keywords=...)`.
-
-**Compound literals via `_` (contextual type):**
-
-```python
-p: Point
-p = _(x=10, y=20)                  # p = (struct Point){ .x = 10, .y = 20 };
-
-items: Point[3] = [
-    _(x=1, y=2),
-    _(x=3, y=4),
-    _(x=5, y=6),
-]
-```
-
-`_(...)` is always “compound literal with designated fields”; the type is taken from the surrounding context (e.g., element type of the array).
 
 ### 2.4 Unions
 
@@ -374,7 +508,16 @@ Use a `sizeof` pseudo-function:
 ```python
 s: int = sizeof(int)                # sizeof(int);
 n: int = sizeof(x)                  # sizeof(x);
-sp: int = sizeof(Point)             # sizeof(struct Point);
+
+# With typedef'd struct
+@typedef(Point)
+class Point:
+    x: int
+
+sp: int = sizeof(Point)             # sizeof(Point);  (uses typedef name)
+sp2: int = sizeof(type[Point])      # sizeof(struct Point);  (explicit struct tag)
+
+# Expression sizeof
 dp: int = sizeof(ptr._)             # sizeof(*ptr);
 ```
 
@@ -837,6 +980,7 @@ from stdlib import *
 
 MAX_SIZE: macro = 100              # #define MAX_SIZE 100
 
+@typedef(Node)
 class Node:
     data: int
     next: -Node
