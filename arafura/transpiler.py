@@ -92,24 +92,49 @@ class CTranspiler(ast.NodeVisitor):
             if isinstance(node.value, ast.Name):
                 name = node.value.id
 
-                # Special case: type[F] (structs), union[F], enum[F]
-                if name in ('type', 'union', 'enum'):
-                    inner_name = node.slice.id if isinstance(node.slice, ast.Name) else None
-                    if inner_name:
-                        # type[F] -> "struct F"
-                        # union[F] -> "union F"
-                        # enum[F] -> "enum F"
-                        if name == 'union':
-                            type_str = f"union {inner_name}"
-                        elif name == 'enum':
-                            type_str = f"enum {inner_name}"
-                        else:  # type
-                            type_str = f"struct {inner_name}"
-
-                        if var_name:
-                            return f"{type_str} {var_name}"
+                # Special case: type[F] (structs), union[F], enum[F], list[T, n], list[T], bit[T, n]
+                if name in ('type', 'union', 'enum', 'list', 'bit'):
+                    # Handle list[T, n] for arrays
+                    if name == 'list':
+                        if isinstance(node.slice, ast.Tuple):
+                            # list[T, n] -> T[n]
+                            if len(node.slice.elts) == 2:
+                                elem_type = self.emit_type(node.slice.elts[0], var_name)
+                                size = self.emit_expr(node.slice.elts[1])
+                                return f"{elem_type}[{size}]".strip()
                         else:
-                            return type_str
+                            # list[T] -> T[] (flexible array member)
+                            elem_type = self.emit_type(node.slice, var_name)
+                            return f"{elem_type}[]".strip()
+
+                    # Handle bit[T, n] for bitfields
+                    elif name == 'bit':
+                        if isinstance(node.slice, ast.Tuple) and len(node.slice.elts) == 2:
+                            base_type = self.emit_type(node.slice.elts[0], "")
+                            bit_width = self.emit_expr(node.slice.elts[1])
+                            if var_name:
+                                return f"{base_type} {var_name} : {bit_width}"
+                            else:
+                                return f"{base_type} : {bit_width}"
+
+                    # Handle type[F], union[F], enum[F]
+                    else:
+                        inner_name = node.slice.id if isinstance(node.slice, ast.Name) else None
+                        if inner_name:
+                            # type[F] -> "struct F"
+                            # union[F] -> "union F"
+                            # enum[F] -> "enum F"
+                            if name == 'union':
+                                type_str = f"union {inner_name}"
+                            elif name == 'enum':
+                                type_str = f"enum {inner_name}"
+                            else:  # type
+                                type_str = f"struct {inner_name}"
+
+                            if var_name:
+                                return f"{type_str} {var_name}"
+                            else:
+                                return type_str
 
                 # Check if it's a qualifier/storage class
                 if name in ('const', 'volatile', 'unsigned', 'static', 'extern', 'long'):
@@ -592,30 +617,80 @@ class CTranspiler(ast.NodeVisitor):
         """Handle if statement."""
         # Check for preprocessor conditional: if [expr]:
         if isinstance(node.test, ast.List) and len(node.test.elts) == 1:
-            # Preprocessor conditional
-            cond_expr = node.test.elts[0]
-
-            # Determine #ifdef, #ifndef, or #if
-            if isinstance(cond_expr, ast.Name):
-                self.emit(f"{self.indent()}#ifdef {cond_expr.id}")
-            elif isinstance(cond_expr, ast.UnaryOp) and isinstance(cond_expr.op, ast.Not):
-                if isinstance(cond_expr.operand, ast.Name):
-                    self.emit(f"{self.indent()}#ifndef {cond_expr.operand.id}")
-                else:
-                    cond_str = self.emit_expr(cond_expr)
-                    self.emit(f"{self.indent()}#if {cond_str}")
-            else:
-                cond_str = self.emit_expr(cond_expr)
-                self.emit(f"{self.indent()}#if {cond_str}")
-
-            # Body
-            for stmt in node.body:
-                self.visit(stmt)
-
-            self.emit(f"{self.indent()}#endif")
+            # Preprocessor conditional - handle full chain with elif/else
+            self.emit_preprocessor_chain(node)
         else:
             # Regular if statement
             self.emit_if_chain(node)
+
+    def emit_preprocessor_chain(self, node: ast.If):
+        """Emit preprocessor conditional chain (#if/#elif/#else/#endif)."""
+        # Emit the initial #if/#ifdef/#ifndef
+        cond_expr = node.test.elts[0]
+
+        # Determine #ifdef, #ifndef, or #if
+        if isinstance(cond_expr, ast.Name):
+            self.emit(f"{self.indent()}#ifdef {cond_expr.id}")
+        elif isinstance(cond_expr, ast.UnaryOp) and isinstance(cond_expr.op, ast.Not):
+            if isinstance(cond_expr.operand, ast.Name):
+                self.emit(f"{self.indent()}#ifndef {cond_expr.operand.id}")
+            else:
+                cond_str = self.emit_expr(cond_expr)
+                self.emit(f"{self.indent()}#if {cond_str}")
+        else:
+            cond_str = self.emit_expr(cond_expr)
+            self.emit(f"{self.indent()}#if {cond_str}")
+
+        # Body
+        for stmt in node.body:
+            self.visit(stmt)
+
+        # Handle elif/else chain
+        self.emit_preprocessor_orelse(node.orelse)
+
+        # Close with #endif
+        self.emit(f"{self.indent()}#endif")
+
+    def emit_preprocessor_orelse(self, orelse_stmts):
+        """Emit preprocessor #elif/#else chain."""
+        if not orelse_stmts:
+            return
+
+        if len(orelse_stmts) == 1 and isinstance(orelse_stmts[0], ast.If):
+            # Check if it's a preprocessor elif
+            elif_node = orelse_stmts[0]
+            if isinstance(elif_node.test, ast.List) and len(elif_node.test.elts) == 1:
+                # Preprocessor elif
+                cond_expr = elif_node.test.elts[0]
+
+                # Determine #elif or #elif defined()
+                if isinstance(cond_expr, ast.Name):
+                    self.emit(f"{self.indent()}#elif defined({cond_expr.id})")
+                elif isinstance(cond_expr, ast.UnaryOp) and isinstance(cond_expr.op, ast.Not):
+                    if isinstance(cond_expr.operand, ast.Name):
+                        self.emit(f"{self.indent()}#elif !defined({cond_expr.operand.id})")
+                    else:
+                        cond_str = self.emit_expr(cond_expr)
+                        self.emit(f"{self.indent()}#elif {cond_str}")
+                else:
+                    cond_str = self.emit_expr(cond_expr)
+                    self.emit(f"{self.indent()}#elif {cond_str}")
+
+                # Body
+                for stmt in elif_node.body:
+                    self.visit(stmt)
+
+                # Recursively handle more elif/else
+                self.emit_preprocessor_orelse(elif_node.orelse)
+            else:
+                # Regular elif in preprocessor context - shouldn't happen, but handle gracefully
+                raise ValueError("Mixed regular and preprocessor conditionals in elif chain")
+        else:
+            # else block
+            self.emit(f"{self.indent()}#else")
+            for stmt in orelse_stmts:
+                self.visit(stmt)
+
 
     def emit_if_chain(self, node: ast.If):
         """Recursively emit if-elif-else chain."""
@@ -657,10 +732,9 @@ class CTranspiler(ast.NodeVisitor):
 
     def visit_While(self, node: ast.While):
         """Handle while statement."""
-        # Check for do-while: while ():
+        # Check for while ():
         if isinstance(node.test, ast.Tuple) and len(node.test.elts) == 0:
-            # Do-while loop
-            # Last statement should be: if COND: continue
+            # Check if it's do-while (ends with 'if COND: continue') or infinite loop (for (;;))
             if node.body and isinstance(node.body[-1], ast.If):
                 last_if = node.body[-1]
                 if (len(last_if.body) == 1 and
@@ -678,8 +752,14 @@ class CTranspiler(ast.NodeVisitor):
                     self.emit(f"{self.indent()}}} while ({cond});")
                     return
 
-            # If we reach here, it's malformed
-            raise ValueError("Malformed do-while: while () must end with 'if COND: continue'")
+            # Infinite loop: for (;;)
+            self.emit(f"{self.indent()}for (;;) {{")
+            self.indent_level += 1
+            for stmt in node.body:
+                self.visit(stmt)
+            self.indent_level -= 1
+            self.emit(f"{self.indent()}}}")
+            return
 
         # Regular while loop
         cond = self.emit_expr(node.test)
@@ -780,6 +860,33 @@ class CTranspiler(ast.NodeVisitor):
             self.emit(f"{self.indent()}goto {label};")
         else:
             raise ValueError(f"Invalid goto pattern: {ast.dump(node)}")
+
+    def visit_Match(self, node: ast.Match):
+        """Handle match statement (switch)."""
+        # match expr: -> switch (expr) {
+        subject = self.emit_expr(node.subject)
+        self.emit(f"{self.indent()}switch ({subject}) {{")
+
+        # Process each case
+        for case in node.cases:
+            # case pattern: -> case value: or default:
+            if isinstance(case.pattern, ast.MatchAs) and case.pattern.pattern is None:
+                # case _: -> default:
+                self.emit(f"{self.indent()}default:")
+            elif isinstance(case.pattern, ast.MatchValue):
+                # case V: -> case V:
+                value = self.emit_expr(case.pattern.value)
+                self.emit(f"{self.indent()}case {value}:")
+            else:
+                raise ValueError(f"Unsupported match pattern: {ast.dump(case.pattern)}")
+
+            # Emit case body
+            self.indent_level += 1
+            for stmt in case.body:
+                self.visit(stmt)
+            self.indent_level -= 1
+
+        self.emit(f"{self.indent()}}}")
 
     def visit_FunctionDef(self, node: ast.FunctionDef):
         """Handle function definition or macro."""
@@ -887,23 +994,41 @@ class CTranspiler(ast.NodeVisitor):
                         # @var(a, b, c)
                         var_names = [arg.id for arg in decorator.args if isinstance(arg, ast.Name)]
 
-        # Record the type
-        if is_union:
-            self.union_types.add(class_name)
-            composite_type = "union"
-        elif is_enum:
-            self.enum_types.add(class_name)
-            composite_type = "enum"
+        # Check if anonymous (class_name is "_")
+        is_anonymous = (class_name == "_")
+
+        # Record the type (but not if anonymous)
+        if not is_anonymous:
+            if is_union:
+                self.union_types.add(class_name)
+                composite_type = "union"
+            elif is_enum:
+                self.enum_types.add(class_name)
+                composite_type = "enum"
+            else:
+                self.struct_types.add(class_name)
+                composite_type = "struct"
         else:
-            self.struct_types.add(class_name)
-            composite_type = "struct"
+            # Anonymous aggregates
+            if is_union:
+                composite_type = "union"
+            elif is_enum:
+                composite_type = "enum"
+            else:
+                composite_type = "struct"
 
         if is_enum:
             # Enum
             if has_typedef:
-                self.emit(f"{self.indent()}typedef enum {class_name} {{")
+                if is_anonymous:
+                    self.emit(f"{self.indent()}typedef enum {{")
+                else:
+                    self.emit(f"{self.indent()}typedef enum {class_name} {{")
             else:
-                self.emit(f"{self.indent()}enum {class_name} {{")
+                if is_anonymous:
+                    self.emit(f"{self.indent()}enum {{")
+                else:
+                    self.emit(f"{self.indent()}enum {class_name} {{")
             self.indent_level += 1
 
             for stmt in node.body:
@@ -941,9 +1066,15 @@ class CTranspiler(ast.NodeVisitor):
         elif is_union:
             # Union
             if has_typedef:
-                self.emit(f"{self.indent()}typedef union {class_name} {{")
+                if is_anonymous:
+                    self.emit(f"{self.indent()}typedef union {{")
+                else:
+                    self.emit(f"{self.indent()}typedef union {class_name} {{")
             else:
-                self.emit(f"{self.indent()}union {class_name} {{")
+                if is_anonymous:
+                    self.emit(f"{self.indent()}union {{")
+                else:
+                    self.emit(f"{self.indent()}union {class_name} {{")
             self.indent_level += 1
 
             for stmt in node.body:
@@ -970,9 +1101,15 @@ class CTranspiler(ast.NodeVisitor):
         else:
             # Struct
             if has_typedef:
-                self.emit(f"{self.indent()}typedef struct {class_name} {{")
+                if is_anonymous:
+                    self.emit(f"{self.indent()}typedef struct {{")
+                else:
+                    self.emit(f"{self.indent()}typedef struct {class_name} {{")
             else:
-                self.emit(f"{self.indent()}struct {class_name} {{")
+                if is_anonymous:
+                    self.emit(f"{self.indent()}struct {{")
+                else:
+                    self.emit(f"{self.indent()}struct {class_name} {{")
             self.indent_level += 1
 
             for stmt in node.body:

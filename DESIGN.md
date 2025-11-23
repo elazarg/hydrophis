@@ -8,16 +8,29 @@ Here’s a cleaned-up, self-consistent version of the design with your constrain
 
 This language is **syntactically valid Python** (passes `ast.parse`) but has **C semantics**. A transpiler reads the Python AST and emits C. Python runtime behavior is irrelevant.
 
-Core constraints:
+### Target: C99/C11
+
+* Target is **C99/C11**. No K&R-style definitions, no pre-C99 constructs.
+* **GNU extensions are out of scope** (inline asm, `__attribute__`, statement expressions, etc.), unless they accidentally behave as ordinary C.
+* Preprocessor support is limited to:
+  * `#include`
+  * constant and function-like `#define`
+  * `#if`, `#ifdef`, `#ifndef`, `#elif`, `#else`, `#endif`
+* Token-level macro tricks (`##`, `#`, pathological `__VA_ARGS__` cases) are not modeled.
+* The language is purely syntactic; runtime semantics are whatever C does.
+
+### Core constraints:
 
 1. Every file must parse with `ast.parse()`.
 2. Semantics are C: primitive types, manual memory, UB, preprocessor, etc.
 3. Translation decisions are **local** on the AST; there is **no type environment**.
-4. `_` is **reserved** and used for address-of, deref, ++/--, compound literals, and pattern wildcards.
+4. `_` is **reserved** and used for address-of, deref, ++/--, compound literals, pattern wildcards, and anonymous aggregates.
 5. C-style `for` uses chained calls with **variables in the `for` target** and **types in the iterable**.
 6. Do–while is encoded via a special `while ():` + trailing `if cond: continue` pattern.
-7. Preprocessor conditionals are `if [expr]:`.
-8. Macros vs variables vs functions are distinguished syntactically, not by runtime.
+7. Infinite loop (`for (;;)`) is encoded as `while ():` without the trailing continue pattern.
+8. Preprocessor conditionals are `if [expr]:`, with full `elif`/`else` chain support.
+9. Switch statements use `match` with `case` patterns and explicit `break` for fallthrough control.
+10. Macros vs variables vs functions are distinguished syntactically, not by runtime.
 
 ---
 
@@ -55,6 +68,8 @@ Pattern: `UnaryOp(USub, type_expr)` → pointer to `type_expr`.
 
 ### 1.3 Array Types
 
+#### 1.3.1 Bracket Syntax
+
 Subscripted types:
 
 ```python
@@ -64,6 +79,18 @@ buf: char[256]         # char buf[256];
 ```
 
 Nested subscripts → multidimensional arrays.
+
+#### 1.3.2 `list[T, n]` Syntax
+
+Alternative array type constructor:
+
+```python
+a: list[int, 10]         # int a[10];
+b: list[-char, n]        # char *b[n];   (VLA if n is non-constant)
+c: list[type[Point], 5]  # struct Point c[5];
+```
+
+The `list[T, n]` notation is equivalent to `T[n]`  Both forms transpile identically.
 
 ### 1.4 Pointer-to-Array Types
 
@@ -316,7 +343,109 @@ class Outer:
 
 → `struct Outer { int value; struct Inner { ... }; struct Inner inner; struct Inner other; };`.
 
-### 2.4 Unions
+### 2.3 Flexible Array Members
+
+A struct's final field can be a flexible array member using `list[T]` (single argument):
+
+```python
+class Buffer:
+    len: int
+    data: list[char]      # flexible array member
+```
+
+**C:**
+
+```c
+struct Buffer {
+    int len;
+    char data[];
+};
+```
+
+Only the **last** field in a struct may use `list[T]` with a single argument. This is a C99 feature.
+
+### 2.4 Bitfields
+
+Use `bit[T, n]` for bitfield declarations (valid only in struct/union fields):
+
+```python
+class Flags:
+    a: bit[unsigned[int], 3]
+    b: bit[unsigned[int], 5]
+    c: bit[int, 1]
+```
+
+**C:**
+
+```c
+struct Flags {
+    unsigned int a : 3;
+    unsigned int b : 5;
+    int c : 1;
+};
+```
+
+Pattern: `bit[T, n]` → `T field : n;`
+
+### 2.5 Anonymous Aggregates
+
+Use `class _` with `@var(...)` for anonymous structs/unions bound to variables:
+
+#### Anonymous Struct
+
+```python
+@var(a)
+class _:
+    x: int
+    y: int
+```
+
+**C:**
+
+```c
+struct {
+    int x;
+    int y;
+} a;
+```
+
+Multiple variables:
+
+```python
+@var(a, b, c)
+class _:
+    x: int
+```
+
+**C:**
+
+```c
+struct {
+    int x;
+} a, b, c;
+```
+
+#### Anonymous Union
+
+```python
+@var(u)
+class _(Union):
+    i: int
+    f: float
+```
+
+**C:**
+
+```c
+union {
+    int i;
+    float f;
+} u;
+```
+
+This covers top-level anonymous aggregates. Anonymous embedded members with field promotion are not modeled.
+
+### 2.6 Unions
 
 ```python
 class Data(Union):                 # union Data {
@@ -328,7 +457,7 @@ d: Data
 d.i = 42
 ```
 
-### 2.5 Enums
+### 2.7 Enums
 
 ```python
 class Color(Enum):                 # enum Color {
@@ -550,9 +679,11 @@ else:
 
 → `if (...) { ... } else if (...) { ... } else { ... }`.
 
-### 5.2 Preprocessor `if`: `if [expr]:`
+### 5.2 Preprocessor `if/elif/else`: `if [expr]:`
 
-Special form for **conditional compilation**:
+Special form for **conditional compilation** with full `elif`/`else` chain support:
+
+**Basic preprocessor if:**
 
 ```python
 if [DEBUG]:
@@ -567,6 +698,8 @@ if [DEBUG]:
 #endif
 ```
 
+**Preprocessor ifndef:**
+
 ```python
 if [not DEBUG]:
     ...
@@ -579,6 +712,8 @@ if [not DEBUG]:
     ...
 #endif
 ```
+
+**Preprocessor expression:**
 
 ```python
 if [DEBUG and LEVEL > 2]:
@@ -593,7 +728,44 @@ if [DEBUG and LEVEL > 2]:
 #endif
 ```
 
-Rule: `If` whose `test` is a `List([expr])` is compiled as a preprocessor `#if/.../#endif`.
+**Preprocessor elif/else chain:**
+
+```python
+if [DEBUG]:
+    printf("debug mode\n")
+elif [VERBOSE]:
+    printf("verbose mode\n")
+elif [QUIET]:
+    printf("quiet mode\n")
+else:
+    printf("normal mode\n")
+```
+
+→
+
+```c
+#ifdef DEBUG
+    printf("debug mode\n");
+#elif defined(VERBOSE)
+    printf("verbose mode\n");
+#elif defined(QUIET)
+    printf("quiet mode\n");
+#else
+    printf("normal mode\n");
+#endif
+```
+
+**Mapping:**
+
+* `if [NAME]:` → `#ifdef NAME`
+* `elif [NAME]:` → `#elif defined(NAME)`
+* `if [not NAME]:` → `#ifndef NAME`
+* `elif [not NAME]:` → `#elif !defined(NAME)`
+* `if [EXPR]:` → `#if EXPR`
+* `elif [EXPR]:` → `#elif EXPR`
+* `else:` → `#else`
+
+Rule: `If` whose `test` is a `List([expr])` is compiled as a preprocessor `#if/.../#endif` with full elif/else chain support.
 
 ### 5.3 While
 
@@ -657,7 +829,36 @@ do {
 
 Python semantics are irrelevant; this is just a recognizable AST pattern.
 
-### 5.5 C-style `for` with Variables in Target, Types in Iterable
+### 5.5 Infinite Loop: `while ():` without final `if`
+
+A `while ():` **without** the trailing `if cond: continue` pattern is an infinite loop (C's `for(;;)`):
+
+```python
+while ():
+    # loop body
+    if some_condition:
+        break
+```
+
+→
+
+```c
+for (;;) {
+    /* loop body */
+    if (some_condition) {
+        break;
+    }
+}
+```
+
+**Mapping:**
+
+* `while ():` with final `if cond: continue` → `do { ... } while (cond);`
+* `while ():` without final `if cond: continue` → `for (;;) { ... }`
+
+This is the canonical representation of C's infinite loop.
+
+### 5.6 C-style `for` with Variables in Target, Types in Iterable
 
 You want loop variables in the `for` binder, and **types** in the iterable.
 
@@ -726,7 +927,7 @@ for (INIT; COND; STEP) {
 
 How you handle declarations vs initialization in detail is up to you, but syntactically the types live in the first call (`TYPES(...)`), and variables are in the `for` target.
 
-### 5.6 Break / Continue
+### 5.7 Break / Continue
 
 Same keywords:
 
@@ -738,7 +939,7 @@ while True:
         continue
 ```
 
-### 5.7 Goto and Labels
+### 5.8 Goto and Labels
 
 Labels:
 
@@ -769,6 +970,73 @@ def sum_to(n: int) -> int:
     END: label
     return s
 ```
+
+### 5.9 Switch Statement: `match` with `case`
+
+C `switch` statements are represented using `match` with `case` patterns:
+
+```python
+match expr:
+    case V1:
+        STMT1
+        break
+    case V2:
+        STMT2
+    case V3:
+        STMT3
+        break
+    case _:
+        DEFAULT_BODY
+        break
+```
+
+**Mapping:**
+
+* `match expr:` → `switch (expr) {`
+* `case V:` → `case V:`
+* `case _:` → `default:`
+* Explicit `break` → `break;` in C
+* Absence of `break` yields fallthrough (like C)
+
+**Example with fallthrough:**
+
+```python
+def test_switch(x: int) -> void:
+    match x:
+        case 1:
+            printf("one\n")
+            break
+        case 2:
+            printf("two or three\n")
+        case 3:
+            printf("three\n")
+            break
+        case _:
+            printf("other\n")
+            break
+```
+
+→
+
+```c
+void test_switch(int x) {
+    switch (x) {
+    case 1:
+        printf("one\n");
+        break;
+    case 2:
+        printf("two or three\n");
+    case 3:
+        printf("three\n");
+        break;
+    default:
+        printf("other\n");
+        break;
+    }
+}
+```
+
+**Note:** Python's rule that "`break` must be inside a loop" is irrelevant here; the code is not intended to run as Python, only to parse to an AST.
 
 ---
 
