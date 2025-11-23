@@ -1,4 +1,4 @@
-Here’s a cleaned-up, self-consistent version of the design with your constraints baked in, and with the `while`/`for` parts fixed the way you asked.
+Here's a cleaned-up, self-consistent version of the design with your constraints baked in, and with the `while`/`for` parts fixed the way you asked.
 
 ---
 
@@ -16,6 +16,7 @@ This language is **syntactically valid Python** (passes `ast.parse`) but has **C
   * `#include`
   * constant and function-like `#define`
   * `#if`, `#ifdef`, `#ifndef`, `#elif`, `#else`, `#endif`
+  * `#undef`
 * Token-level macro tricks (`##`, `#`, pathological `__VA_ARGS__` cases) are not modeled.
 * The language is purely syntactic; runtime semantics are whatever C does.
 
@@ -128,14 +129,47 @@ def counter() -> int:
 
 Purely syntactic: `NAME[TYPE]` → `NAME TYPE`.
 
-### 1.6 Type Aliases (`typedef`)
+### 1.6 C11 Qualifiers
+
+#### 1.6.1 `_Atomic`
+
+```python
+x: atomic[int]             # _Atomic int x;
+p: -atomic[int]            # _Atomic int *p;
+```
+
+`atomic` composes with other qualifiers:
+
+```python
+x: const[atomic[int]]      # const _Atomic int x;
+```
+
+#### 1.6.2 `_Alignas`
+
+Two-parameter qualifier for alignment:
+
+```python
+x: alignas[16, int]            # _Alignas(16) int x;
+y: alignas[64, atomic[int]]    # _Alignas(64) _Atomic int y;
+```
+
+Only meaningful for declared objects (variables, fields).
+
+#### 1.6.3 `_Thread_local`
+
+```python
+x: thread_local[int]                   # _Thread_local int x;
+y: static[thread_local[int]]           # static _Thread_local int y;
+```
+
+### 1.7 Type Aliases (`typedef`)
 
 Use `type`:
 
 ```python
-type int_ptr = -int                 # typedef int *int_ptr;
-type binop = int(int, int)          # typedef int (*binop)(int, int);
-type byte = unsigned[char]          # typedef unsigned char byte;
+type int_ptr = -int                     # typedef int *int_ptr;
+type binop = -(int, int)int             # typedef int (*binop)(int, int);
+type byte = unsigned[char]              # typedef unsigned char byte;
 ```
 
 You can use `type[...]` on the right-hand side:
@@ -146,7 +180,7 @@ class Point:
     x: int
     y: int
 
-type PointPtr = -type[Point]        # typedef Point *PointPtr;
+type PointPtr = -type[Point]        # typedef struct Point *PointPtr;
 ```
 
 ---
@@ -389,9 +423,9 @@ Pattern: `bit[T, n]` → `T field : n;`
 
 ### 2.5 Anonymous Aggregates
 
-Use `class _` with `@var(...)` for anonymous structs/unions bound to variables:
+Use `class _` with `@var(...)` for top-level anonymous structs/unions bound to variables.
 
-#### Anonymous Struct
+#### 2.5.1 Top-Level Anonymous Struct
 
 ```python
 @var(a)
@@ -425,7 +459,7 @@ struct {
 } a, b, c;
 ```
 
-#### Anonymous Union
+#### 2.5.2 Top-Level Anonymous Union
 
 ```python
 @var(u)
@@ -443,7 +477,57 @@ union {
 } u;
 ```
 
-This covers top-level anonymous aggregates. Anonymous embedded members with field promotion are not modeled.
+#### 2.5.3 Embedded Anonymous Aggregates
+
+Inside a `struct` or `union`, a nested `class _` **without** `@var` indicates an anonymous embedded member (C11 feature):
+
+**Anonymous embedded struct:**
+
+```python
+class Outer:
+    a: int
+
+    class _:
+        x: int
+        y: int
+```
+
+**C:**
+
+```c
+struct Outer {
+    int a;
+    struct {
+        int x;
+        int y;
+    };
+};
+```
+
+**Anonymous embedded union:**
+
+```python
+class Outer:
+    tag: int
+
+    class _(Union):
+        i: int
+        f: float
+```
+
+**C:**
+
+```c
+struct Outer {
+    int tag;
+    union {
+        int i;
+        float f;
+    };
+};
+```
+
+We do **not** model field promotion behavior; this is pure syntax.
 
 ### 2.6 Unions
 
@@ -458,6 +542,8 @@ d.i = 42
 ```
 
 ### 2.7 Enums
+
+#### 2.7.1 Named Enums
 
 ```python
 class Color(Enum):                 # enum Color {
@@ -475,7 +561,50 @@ if c == GREEN:
     ...
 ```
 
-The transpiler treats `RED`, `GREEN`, `BLUE` as enum constants; Python’s Enum runtime is ignored.
+The transpiler treats `RED`, `GREEN`, `BLUE` as enum constants; Python's Enum runtime is ignored.
+
+#### 2.7.2 Anonymous Enums with `@var`
+
+Use `class _(Enum):` with `@var` for anonymous enums:
+
+**Embedded in struct:**
+
+```python
+class Outer:
+    @var(color)
+    class _(Enum):
+        RED = 0
+        GREEN = 1
+```
+
+**C:**
+
+```c
+struct Outer {
+    enum {
+        RED = 0,
+        GREEN = 1
+    } color;
+};
+```
+
+**Top-level:**
+
+```python
+@var(color)
+class _(Enum):
+    RED = 0
+    GREEN = 1
+```
+
+**C:**
+
+```c
+enum {
+    RED = 0,
+    GREEN = 1
+} color;
+```
 
 ---
 
@@ -483,7 +612,28 @@ The transpiler treats `RED`, `GREEN`, `BLUE` as enum constants; Python’s Enum 
 
 `_` is **reserved**. It must not be used as a normal variable or function.
 
-### 3.1 Address-of
+### 3.1 Escaped Identifiers: `__ID`
+
+To reference identifiers that would conflict with the reserved `_`, use a double-underscore prefix:
+
+```python
+__ID
+```
+
+maps to the C identifier:
+
+```c
+ID
+```
+
+i.e. **the leading two underscores are stripped** in translation.
+
+Examples:
+
+* Python `___` (`__` + `_`) → C `_`
+* Python `__FILE__` → C `FILE__` (for exact `__FILE__`, write `____FILE__`)
+
+### 3.2 Address-of
 
 `_.target` → `&target`:
 
@@ -497,7 +647,7 @@ p0: -int = _.arr[0]                # int *p0 = &arr[0];
 
 Pattern: `Attribute(value=Name('_'), attr=...)`.
 
-### 3.2 Dereference
+### 3.3 Dereference
 
 `expr._` → `*expr`:
 
@@ -515,7 +665,7 @@ pp._._ = 42                        # **pp = 42;
 
 Pattern: `Attribute(expr, '_')`, nested as needed.
 
-### 3.3 Pointer Member Access
+### 3.4 Pointer Member Access
 
 No type-based guessing. Use `._.` explicitly:
 
@@ -534,7 +684,7 @@ Rule:
 * `p.x` → `p.x`
 * `ptr._.x` → `ptr->x`
 
-### 3.4 Increment / Decrement
+### 3.5 Increment / Decrement
 
 Encode `++`/`--` with `_` and `**`/`//`:
 
@@ -575,7 +725,7 @@ And combined with deref:
 _ ** (ptr._)                         # ++(*ptr);
 ```
 
-### 3.5 Compound Literals via `_`
+### 3.6 Compound Literals via `_`
 
 Already covered above: `_(field=value, ...)` is a compound literal with designated initializers at the contextual type.
 
@@ -618,17 +768,31 @@ while (c := getchar()):
 
 ### 4.4 Casts
 
-Cast syntax: `[TYPE](expr)`:
+Two equivalent cast syntaxes are supported:
+
+#### 4.4.1 List-based Cast: `[TYPE](expr)`
 
 ```python
 i: int = [int](3.14)                # (int)3.14;
 p: -int = [-int](vp)                # (int *)vp;
-c: char =                 # (char)65;
+c: char = [char](65)                # (char)65;
 f: float = [float](i)               # (float)i;
 pp: --int = [--int](something)      # (int **)(something);
 ```
 
 Pattern: `Call(func=List([TYPE_EXPR]), args=[EXPR])`.
+
+#### 4.4.2 Subscript-based Cast: `cast[TYPE](expr)`
+
+```python
+i: int = cast[int](3.14)            # (int)3.14;
+p: -int = cast[-int](vp)            # (int *)vp;
+c: char = cast[char](65)            # (char)65;
+f: float = cast[float](i)           # (float)i;
+pp: --int = cast[--int](something)  # (int **)(something);
+```
+
+Both forms are equivalent and produce `(TYPE)(expr)` in C.
 
 ### 4.5 `sizeof`
 
@@ -650,7 +814,17 @@ sp2: int = sizeof(type[Point])      # sizeof(struct Point);  (explicit struct ta
 dp: int = sizeof(ptr._)             # sizeof(*ptr);
 ```
 
-### 4.6 NULL
+### 4.6 `alignof`
+
+Use the `alignof` subscript syntax:
+
+```python
+a: size_t = alignof[int]                # _Alignof(int);
+b: size_t = alignof[type[Node]]         # _Alignof(struct Node);
+c: size_t = alignof[atomic[int]]        # _Alignof(_Atomic int);
+```
+
+### 4.7 NULL
 
 `None` is `NULL`:
 
@@ -848,6 +1022,20 @@ for (;;) {
     if (some_condition) {
         break;
     }
+}
+```
+
+**Empty infinite loop:**
+
+```python
+while ():
+    pass
+```
+
+→
+
+```c
+for (;;) {
 }
 ```
 
@@ -1067,24 +1255,66 @@ def MAX(a, b):                      # macro: #define MAX(a,b) ...
     a if a > b else b
 ```
 
-### 6.2 Function Pointers
+### 6.2 Function Types and Function Pointers
 
-Type annotations:
+#### 6.2.1 Function Type Syntax: `(Args)Result`
+
+A function type is written as:
 
 ```python
-fptr: int(int, int)                 # int (*fptr)(int, int);
-cb: void(-char)                     # void (*cb)(char *);
-cmp: int(-void, -void)              # int (*cmp)(void *, void *);
-noarg: int()                        # int (*noarg)(void);
+(Arg1, Arg2, ..., ArgN)Result
 ```
 
-Usage:
+Semantically: "function taking Arg1, …, ArgN and returning Result".
+
+**Usage in type aliases:**
 
 ```python
+type F = (int, int)int              # typedef int F(int, int);
+type G = (double)void               # typedef void G(double);
+```
+
+**Usage in function declarations:**
+
+```python
+f: (int, int)int                    # int f(int, int);
+g: (double)void                     # void g(double);
+```
+
+(Note: you still define functions with `def` as before; this is the *type* level, not the definition syntax.)
+
+#### 6.2.2 Function Pointer Type Syntax: `-(Args)Result`
+
+A **function pointer** type is the unary-minus of a function type:
+
+```python
+-(Arg1, Arg2)Result
+```
+
+**Examples:**
+
+```python
+pf: -(int, int)int                  # int (*pf)(int, int);
+cb: -(void(-char))void              # void (*cb)(void (*)(char *));
+cmp: -(-void, -void)int             # int (*cmp)(void *, void *);
+```
+
+**Type aliases:**
+
+```python
+type BinOp = -(int, int)int         # typedef int (*BinOp)(int, int);
+```
+
+**Usage:**
+
+```python
+fptr: -(int, int)int                # int (*fptr)(int, int);
 fptr = add                          # fptr = add;
 r: int = fptr(5, 3)                 # int r = fptr(5,3);
 r2: int = (fptr._)(5, 3)            # int r2 = (*fptr)(5,3);
 ```
+
+This is the **canonical** way to write function pointer types.
 
 ---
 
@@ -1165,15 +1395,55 @@ from stdio import *
 printf("hello\n")
 ```
 
-### 7.4 Preprocessor Conditionals
+### 7.4 `#undef`: `del NAME`
+
+Use `del` statement for `#undef`:
+
+```python
+del X                               # #undef X
+del X, Y, Z                         # #undef X
+                                    # #undef Y
+                                    # #undef Z
+```
+
+Rules:
+
+* Only bare names are allowed in `del` for this purpose.
+* `del` statements at top level or inside preprocessor conditionals translate to `#undef` directives.
+* `del` is **not** a runtime construct here; it is purely preprocessor-surface.
+
+### 7.5 Preprocessor Conditionals
 
 As already specified: `if [expr]:` around a block → `#if expr` / `#endif`.
 
 ---
 
-## 8. Arrays, Memory, Strings
+## 8. Statements and Declarations
 
-### 8.1 Arrays
+### 8.1 `_Static_assert`
+
+Use a dedicated statement:
+
+```python
+static_assert(EXPR, "message")      # _Static_assert(EXPR, "message");
+```
+
+This is legal at file scope and, in C11, in block scope. The language treats it as a statement permissible wherever C allows `_Static_assert`.
+
+Examples:
+
+```python
+static_assert(sizeof(int) == 4, "int must be 4 bytes")
+
+def foo() -> void:
+    static_assert(sizeof(-void) == sizeof(size_t), "pointer size mismatch")
+```
+
+---
+
+## 9. Arrays, Memory, Strings
+
+### 9.1 Arrays
 
 ```python
 arr: int[10]                        # int arr[10];
@@ -1203,7 +1473,7 @@ p: -int = arr                       # int *p = arr;
 q: -int = _.arr[0]                  # int *q = &arr[0];
 ```
 
-### 8.2 Memory Management
+### 9.2 Memory Management
 
 ```python
 from stdlib import *
@@ -1222,7 +1492,7 @@ if arr2 == None:
     return -1
 ```
 
-### 8.3 Strings
+### 9.3 Strings
 
 ```python
 s: -char = "hello"                 # char *s = "hello";
@@ -1240,7 +1510,7 @@ strcpy(buf, s)
 
 ---
 
-## 9. Small End-to-End Example
+## 10. Small End-to-End Example
 
 ```python
 from stdio import *

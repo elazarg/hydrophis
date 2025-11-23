@@ -31,6 +31,16 @@ class CTranspiler(ast.NodeVisitor):
         """Get the final C code."""
         return "\n".join(self.output)
 
+    def escape_identifier(self, name: str) -> str:
+        """
+        Escape identifiers: __ID -> ID (strips leading double underscore).
+        This allows using reserved _ and dangerous identifiers.
+        Examples: ___ -> _, __FILE__ -> FILE__
+        """
+        if name.startswith("__"):
+            return name[2:]
+        return name
+
     # ========================================================================
     # TYPE EMISSION
     # ========================================================================
@@ -57,6 +67,30 @@ class CTranspiler(ast.NodeVisitor):
                 return type_name
 
         elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+            # Check if it's a function pointer type: -(int, int)(int)
+            if isinstance(node.operand, ast.Call) and isinstance(node.operand.func, ast.Tuple):
+                # Function pointer type: -(arg1, arg2, ...)(result)
+                # Extract arg types from tuple and return type from call arg
+                call_node = node.operand
+                arg_types = call_node.func.elts  # Tuple of arg types
+                if len(call_node.args) != 1:
+                    raise ValueError(f"Function type must have exactly one return type: {ast.dump(node)}")
+                ret_type_node = call_node.args[0]
+
+                # Emit parameter types
+                param_types = ", ".join(self.emit_type(arg, "") for arg in arg_types)
+                if not param_types:
+                    param_types = "void"
+
+                # Emit return type
+                ret_type = self.emit_type(ret_type_node, "")
+
+                # Emit as function pointer
+                if var_name:
+                    return f"{ret_type} (*{var_name})({param_types})"
+                else:
+                    return f"{ret_type} (*)({param_types})"
+
             # Pointer type: -int -> int *
             # Get inner type without var_name
             inner = self.emit_type(node.operand, "")
@@ -136,11 +170,25 @@ class CTranspiler(ast.NodeVisitor):
                             else:
                                 return type_str
 
+                # Check if it's alignas[N, T]
+                if name == 'alignas':
+                    if isinstance(node.slice, ast.Tuple) and len(node.slice.elts) == 2:
+                        align_val = self.emit_expr(node.slice.elts[0])
+                        inner_type = self.emit_type(node.slice.elts[1], var_name)
+                        return f"_Alignas({align_val}) {inner_type}".strip()
+
                 # Check if it's a qualifier/storage class
-                if name in ('const', 'volatile', 'unsigned', 'static', 'extern', 'long'):
+                if name in ('const', 'volatile', 'unsigned', 'static', 'extern', 'long', 'atomic', 'thread_local'):
+                    # Map to C names
+                    c_name = name
+                    if name == 'atomic':
+                        c_name = '_Atomic'
+                    elif name == 'thread_local':
+                        c_name = '_Thread_local'
+
                     # Qualifier: const[int] -> const int
                     inner_type = self.emit_type(node.slice, var_name)
-                    return f"{name} {inner_type}".strip()
+                    return f"{c_name} {inner_type}".strip()
                 else:
                     # Array type: int[10] -> int[10]
                     dims = self.collect_array_dimensions(node)
@@ -186,7 +234,33 @@ class CTranspiler(ast.NodeVisitor):
                 raise ValueError(f"Unhandled subscript type: {ast.dump(node)}")
 
         elif isinstance(node, ast.Call):
-            # Function pointer type: int(int, int) -> int (*)(int, int)
+            # Check for new function type syntax: (arg1, arg2, ...)(result)
+            if isinstance(node.func, ast.Tuple):
+                # Function type: (arg1, arg2, ...)(result)
+                # Extract arg types from tuple and return type from call arg
+                arg_types = node.func.elts  # Tuple of arg types
+                if len(node.args) != 1:
+                    raise ValueError(f"Function type must have exactly one return type: {ast.dump(node)}")
+                ret_type_node = node.args[0]
+
+                # Emit parameter types
+                param_types = ", ".join(self.emit_type(arg, "") for arg in arg_types)
+                if not param_types:
+                    param_types = "void"
+
+                # Emit return type
+                ret_type = self.emit_type(ret_type_node, "")
+
+                # Emit as function type (not pointer)
+                # In type alias: typedef int F(int, int);
+                # In declaration: int f(int, int);
+                if var_name:
+                    return f"{ret_type} {var_name}({param_types})"
+                else:
+                    return f"{ret_type} ({param_types})"
+
+            # Old function pointer type: int(int, int) -> int (*)(int, int)
+            # This is legacy syntax, kept for backwards compatibility
             ret_type = self.emit_type(node.func, "")
             param_types = ", ".join(self.emit_type(arg, "") for arg in node.args)
             if not param_types:
@@ -226,7 +300,7 @@ class CTranspiler(ast.NodeVisitor):
             elif node.id == 'False':
                 return '0'
             else:
-                return node.id
+                return self.escape_identifier(node.id)
 
         elif isinstance(node, ast.BinOp):
             return self.emit_binop(node)
@@ -417,7 +491,7 @@ class CTranspiler(ast.NodeVisitor):
         """Emit function call."""
         # Check for special forms
 
-        # Cast: [TYPE](expr)
+        # Cast: [TYPE](expr) or cast[TYPE](expr)
         if isinstance(node.func, ast.List) and len(node.func.elts) == 1:
             type_expr = node.func.elts[0]
             if len(node.args) == 1:
@@ -425,23 +499,48 @@ class CTranspiler(ast.NodeVisitor):
                 expr_str = self.emit_expr(node.args[0])
                 return f"(({type_str})({expr_str}))"
 
-        # sizeof(...)
-        if isinstance(node.func, ast.Name) and node.func.id == 'sizeof':
+        # cast[TYPE](expr)
+        if isinstance(node.func, ast.Subscript):
+            if isinstance(node.func.value, ast.Name) and node.func.value.id == 'cast':
+                if len(node.args) == 1:
+                    type_str = self.emit_type(node.func.slice, "")
+                    expr_str = self.emit_expr(node.args[0])
+                    return f"(({type_str})({expr_str}))"
+
+        # sizeof(...) and alignof(...)
+        if isinstance(node.func, ast.Name) and node.func.id in ('sizeof', 'alignof'):
+            func_name = 'sizeof' if node.func.id == 'sizeof' else '_Alignof'
             if len(node.args) == 1:
                 arg = node.args[0]
                 # Emit the type as-is using emit_type
                 # This respects type[F], enum[E], union[U] syntax
                 if isinstance(arg, ast.Name):
                     # Simple name - emit as-is (could be typedef or basic type)
-                    return f"sizeof({arg.id})"
+                    return f"{func_name}({arg.id})"
                 elif isinstance(arg, ast.Subscript):
                     # Could be type[F], enum[E], union[U], or array type
                     type_str = self.emit_type(arg, "")
-                    return f"sizeof({type_str})"
+                    return f"{func_name}({type_str})"
                 else:
                     # Expression like sizeof(ptr._) or sizeof(arr[0])
                     arg_str = self.emit_expr(arg)
-                    return f"sizeof({arg_str})"
+                    return f"{func_name}({arg_str})"
+
+        # alignof[T] - subscript form
+        if isinstance(node.func, ast.Subscript):
+            if isinstance(node.func.value, ast.Name) and node.func.value.id == 'alignof':
+                if len(node.args) == 0:
+                    type_str = self.emit_type(node.func.slice, "")
+                    return f"_Alignof({type_str})"
+
+        # static_assert(expr, msg)
+        # This is actually a statement, but checking here for now
+        if isinstance(node.func, ast.Name) and node.func.id == 'static_assert':
+            if len(node.args) == 2:
+                expr_str = self.emit_expr(node.args[0])
+                msg_str = self.emit_expr(node.args[1])
+                # Return as expression (will be handled in visit_Expr)
+                return f"_Static_assert({expr_str}, {msg_str})"
 
         # Compound literal with _: _(x=1, y=2)
         if isinstance(node.func, ast.Name) and node.func.id == '_':
@@ -502,6 +601,11 @@ class CTranspiler(ast.NodeVisitor):
 
     def emit_subscript(self, node: ast.Subscript) -> str:
         """Emit subscript (array access)."""
+        # Check for alignof[T] expression
+        if isinstance(node.value, ast.Name) and node.value.id == 'alignof':
+            type_str = self.emit_type(node.slice, "")
+            return f"_Alignof({type_str})"
+
         value = self.emit_expr(node.value)
         index = self.emit_expr(node.slice)
         return f"{value}[{index}]"
@@ -544,7 +648,7 @@ class CTranspiler(ast.NodeVisitor):
     def visit_AnnAssign(self, node: ast.AnnAssign):
         """Handle annotated assignment (variable declaration)."""
         if isinstance(node.target, ast.Name):
-            var_name = node.target.id
+            var_name = self.escape_identifier(node.target.id)
 
             # Check if it's a label
             if isinstance(node.annotation, ast.Name) and node.annotation.id == 'label':
@@ -860,6 +964,15 @@ class CTranspiler(ast.NodeVisitor):
             self.emit(f"{self.indent()}goto {label};")
         else:
             raise ValueError(f"Invalid goto pattern: {ast.dump(node)}")
+
+    def visit_Delete(self, node: ast.Delete):
+        """Handle del statement (#undef)."""
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                name = self.escape_identifier(target.id)
+                self.emit(f"{self.indent()}#undef {name}")
+            else:
+                raise ValueError(f"Invalid #undef target: {ast.dump(target)}")
 
     def visit_Match(self, node: ast.Match):
         """Handle match statement (switch)."""
